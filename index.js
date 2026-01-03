@@ -1,72 +1,37 @@
 // tool-proxy.js
-// Version: 2.0.0 (AnyToolCall Edition)
+// AnyToolCall Proxy - transparent SSE passthrough + tool-call via prompt injection
+// Node.js >= 18
+//
+// Run:
+//   npm i express
+//   ALLOW_LOCAL_NET=true node tool-proxy.js
+//
+// Env:
+//   PORT=3000
+//   LOG_ENABLED=true|false (default false)
+//   LOG_DIR=./logs
+//   ALLOW_LOCAL_NET=true|false (default false)  <-- SSRF protection
+
+'use strict';
+
 const express = require('express');
-const { Transform } = require('stream');
 const fs = require('fs');
 const path = require('path');
 const dns = require('dns').promises;
-const url = require('url');
 
 const app = express();
-// 增大 body limit 以支持上传图片等大 payload
 app.use(express.json({ limit: '50mb' }));
 
-// ============ 配置 ============
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+
+// ============ Logging (default off) ============
 const LOG_DIR = process.env.LOG_DIR || './logs';
-const LOG_ENABLED = process.env.LOG_ENABLED === 'true'; // 默认关闭日志保存
-const ALLOW_LOCAL_NET = process.env.ALLOW_LOCAL_NET === 'true'; // 默认禁止转发到内网
+const LOG_ENABLED = process.env.LOG_ENABLED === 'true';
 
 if (LOG_ENABLED && !fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
-// ============ 安全检查 (SSRF 防护) ============
-async function validateUpstream(upstreamUrl) {
-  if (!upstreamUrl) return { valid: false, error: 'Missing upstream URL' };
-  
-  try {
-    const parsed = new url.URL(upstreamUrl);
-    
-    // 1. 协议检查
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
-      return { valid: false, error: 'Invalid protocol (http/https only)' };
-    }
-
-    // 如果允许内网，直接通过
-    if (ALLOW_LOCAL_NET) return { valid: true };
-
-    // 2. 主机名检查 (防止 localhost)
-    const hostname = parsed.hostname;
-    if (['localhost', '127.0.0.1', '::1', '0.0.0.0'].includes(hostname)) {
-      return { valid: false, error: 'Localhost access denied (Set ALLOW_LOCAL_NET=true to enable)' };
-    }
-
-    // 3. DNS 解析检查私有 IP
-    // 注意: 这只是基础防护，生产环境建议配合防火墙
-    try {
-      const { address } = await dns.lookup(hostname);
-      const parts = address.split('.').map(Number);
-      
-      // 简单的 IPv4 私有地址检查
-      if (parts.length === 4) {
-        if (parts[0] === 10) return { valid: false, error: 'Private IP range (10.x.x.x) denied' };
-        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return { valid: false, error: 'Private IP range (172.16-31.x.x) denied' };
-        if (parts[0] === 192 && parts[1] === 168) return { valid: false, error: 'Private IP range (192.168.x.x) denied' };
-        if (parts[0] === 127) return { valid: false, error: 'Loopback IP denied' };
-      }
-    } catch (e) {
-      // DNS 解析失败通常意味着无法连接，暂且放行让 fetch 报错，或者拦截
-      // 这里选择放行，因为可能是内部 DNS
-    }
-
-    return { valid: true };
-  } catch (e) {
-    return { valid: false, error: 'Invalid URL format' };
-  }
-}
-
-// ============ 日志系统 ============
 class RequestLogger {
   constructor() {
     this.enabled = LOG_ENABLED;
@@ -75,29 +40,82 @@ class RequestLogger {
     this.data = {
       requestId: this.requestId,
       timestamp: new Date().toISOString(),
-      phases: []
+      phases: [],
     };
   }
 
   log(phase, content) {
     if (!this.enabled) return;
-    const entry = { phase, time: Date.now() - this.startTime, content };
-    this.data.phases.push(entry);
-    
-    // 控制台仅输出简略信息
-    const str = typeof content === 'string' ? content : JSON.stringify(content);
-    console.log(`[${this.requestId}] ${phase}: ${str.slice(0, 150)}${str.length > 150 ? '...' : ''}`);
+    this.data.phases.push({
+      phase,
+      time: Date.now() - this.startTime,
+      content,
+    });
   }
 
   save() {
     if (!this.enabled) return;
     const filename = path.join(LOG_DIR, `${this.requestId}.json`);
     fs.writeFileSync(filename, JSON.stringify(this.data, null, 2), 'utf-8');
-    console.log(`[${this.requestId}] 📁 Log saved: ${filename}`);
   }
 }
 
-// ============ 定界符系统 ============
+// ============ SSRF protection ============
+const ALLOW_LOCAL_NET = process.env.ALLOW_LOCAL_NET === 'true';
+
+function isPrivateIPv4(ip) {
+  const parts = ip.split('.').map((n) => Number(n));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
+
+  const [a, b] = parts;
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 0) return true;
+  if (a === 169 && b === 254) return true; // link-local
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  return false;
+}
+
+async function validateUpstream(upstreamUrl) {
+  if (!upstreamUrl) return { ok: false, error: 'Missing upstream URL' };
+
+  let parsed;
+  try {
+    parsed = new URL(upstreamUrl);
+  } catch {
+    return { ok: false, error: 'Invalid upstream URL' };
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return { ok: false, error: 'Invalid protocol (http/https only)' };
+  }
+
+  if (ALLOW_LOCAL_NET) return { ok: true };
+
+  const hostname = parsed.hostname;
+
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0' || hostname === '::1') {
+    return { ok: false, error: 'Localhost denied (set ALLOW_LOCAL_NET=true to allow)' };
+  }
+
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname) && isPrivateIPv4(hostname)) {
+    return { ok: false, error: 'Private IPv4 denied (set ALLOW_LOCAL_NET=true to allow)' };
+  }
+
+  try {
+    const { address } = await dns.lookup(hostname);
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(address) && isPrivateIPv4(address)) {
+      return { ok: false, error: 'DNS resolved to private IPv4 denied (set ALLOW_LOCAL_NET=true to allow)' };
+    }
+  } catch {
+    // DNS lookup failed -> let fetch fail upstream; do not block here to avoid breaking custom DNS
+  }
+
+  return { ok: true };
+}
+
+// ============ AnyToolCall Delimiters ============
 const DELIMITER_SETS = [
   { open: '༒', close: '༒', mid: '࿇' },
   { open: '꧁', close: '꧂', mid: '࿔' },
@@ -115,7 +133,7 @@ const SUFFIX_POOL = [
 class ToolCallDelimiter {
   constructor() {
     this.markers = this.generateMarkers();
-    console.log('🔧 AnyToolCall Delimiters initialized:\n' + this.describe());
+    console.log('🔧 AnyToolCall delimiters initialized:\n' + this.describe());
   }
 
   generateMarkers() {
@@ -123,7 +141,7 @@ class ToolCallDelimiter {
     const suffix1 = SUFFIX_POOL[Math.floor(Math.random() * SUFFIX_POOL.length)];
     const suffix2 = SUFFIX_POOL[Math.floor(Math.random() * SUFFIX_POOL.length)];
     const { open, close, mid } = set;
-    
+
     return {
       TC_START: `${open}${suffix1}ᐅ`,
       TC_END: `ᐊ${suffix1}${close}`,
@@ -145,7 +163,7 @@ class ToolCallDelimiter {
   getSystemPrompt(tools) {
     const m = this.markers;
     return `
-## Tool Calling (AnyToolCall Protocol)
+## AnyToolCall (Prompt-Injection Tool Calling)
 
 You have access to the following tools:
 ${tools.map(t => `- **${t.function.name}**: ${t.function.description || 'No description'}
@@ -160,59 +178,45 @@ ${m.NAME_START}function_name${m.NAME_END}
 ${m.ARGS_START}{"param": "value"}${m.ARGS_END}
 ${m.TC_END}
 
-### Example
-
-I'll search for that information:
-
-${m.TC_START}
-${m.NAME_START}web_search${m.NAME_END}
-${m.ARGS_START}{"query": "example", "limit": 5}${m.ARGS_END}
-${m.TC_END}
-
 ### Rules
 
 1. Tool calls MUST be at the END of your response
-2. Copy the delimiters EXACTLY as shown above
+2. Copy the delimiters EXACTLY
 3. Arguments must be valid JSON
 4. One tool per block
-
-### Tool Results
-
-Results appear in ${m.RESULT_START}...${m.RESULT_END} blocks.
-`;
+`.trim();
   }
 
-  parse(content, logger = null) {
+  parse(content) {
     const m = this.markers;
-    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
     const regex = new RegExp(
       `${esc(m.TC_START)}\\s*` +
-      `${esc(m.NAME_START)}([\\s\\S]*?)${esc(m.NAME_END)}\\s*` +
-      `${esc(m.ARGS_START)}([\\s\\S]*?)${esc(m.ARGS_END)}\\s*` +
-      `${esc(m.TC_END)}`,
+        `${esc(m.NAME_START)}([\\s\\S]*?)${esc(m.NAME_END)}\\s*` +
+        `${esc(m.ARGS_START)}([\\s\\S]*?)${esc(m.ARGS_END)}\\s*` +
+        `${esc(m.TC_END)}`,
       'g'
     );
 
     const toolCalls = [];
     let match;
     let idx = 0;
-    
+
     while ((match = regex.exec(content)) !== null) {
       const name = match[1].trim();
       const argsStr = match[2].trim();
-      
+
       try {
         JSON.parse(argsStr);
-      } catch (e) {
-        console.warn(`⚠️ Invalid JSON in tool call "${name}": ${argsStr}`);
+      } catch {
         continue;
       }
-      
+
       toolCalls.push({
         id: `call_${Date.now()}_${idx++}`,
         type: 'function',
-        function: { name, arguments: argsStr }
+        function: { name, arguments: argsStr },
       });
     }
 
@@ -223,290 +227,457 @@ Results appear in ${m.RESULT_START}...${m.RESULT_END} blocks.
 
 const delimiter = new ToolCallDelimiter();
 
-// ============ 消息处理核心逻辑 ============
+// ============ Request message transforms ============
 
-// 1. 合并相邻的相同 role 消息 (解决 Gemini 400 错误)
-function mergeAdjacentMessages(messages, logger = null) {
-  if (messages.length === 0) return messages;
-  
+function mergeAdjacentMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages || [];
+
   const merged = [];
   let current = { ...messages[0] };
-  
+
   for (let i = 1; i < messages.length; i++) {
     const msg = messages[i];
-    
     if (msg.role === current.role) {
-      const separator = '\n\n';
-      current.content = (current.content || '') + separator + (msg.content || '');
+      current.content = `${current.content || ''}\n\n${msg.content || ''}`;
     } else {
       merged.push(current);
       current = { ...msg };
     }
   }
-  
   merged.push(current);
   return merged;
 }
 
-// 2. 转换请求 (支持有/无 tools 两种模式)
-function transformRequest(request, logger = null, hasTools = true) {
+/**
+ * Transform OpenAI-style tools/tool_calls/tool results into prompt-injection mode.
+ * - If hasTools=true: inject system prompt + encode tool results with RESULT markers.
+ * - If hasTools=false but hasToolHistory=true: strip structured tool_calls/tool role into plain text (to avoid Gemini 400s).
+ */
+function transformRequest(request, { hasTools }) {
   const m = delimiter.markers;
-  let messages = [];
-
-  const tools = request.tools || [];
+  const tools = Array.isArray(request.tools) ? request.tools : [];
   const toolSystemPrompt = hasTools && tools.length ? delimiter.getSystemPrompt(tools) : '';
+
+  const outMessages = [];
   let hasSystem = false;
 
-  for (const msg of request.messages) {
+  for (const msg of request.messages || []) {
     if (msg.role === 'system') {
-      messages.push({
+      outMessages.push({
         role: 'system',
-        content: msg.content + (toolSystemPrompt ? '\n\n' + toolSystemPrompt : '')
+        content: (msg.content || '') + (toolSystemPrompt ? '\n\n' + toolSystemPrompt : ''),
       });
       hasSystem = true;
+      continue;
+    }
 
-    } else if (msg.role === 'assistant' && msg.tool_calls?.length) {
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
       let content = msg.content || '';
-      
+
       if (hasTools) {
-        // 有 tools：转换为定界符格式
         for (const tc of msg.tool_calls) {
           content += `\n${m.TC_START}\n${m.NAME_START}${tc.function.name}${m.NAME_END}\n${m.ARGS_START}${tc.function.arguments}${m.ARGS_END}\n${m.TC_END}`;
         }
       } else {
-        // 无 tools：清洗历史，转为纯文本
-        const callSummary = msg.tool_calls.map(tc => tc.function.name).join(', ');
-        content += `\n\n[Called tools: ${callSummary}]`;
+        const names = msg.tool_calls.map((tc) => tc.function?.name).filter(Boolean).join(', ');
+        content += `\n\n[Called tools: ${names}]`;
       }
-      
-      messages.push({ role: 'assistant', content });
 
-    } else if (msg.role === 'tool') {
+      outMessages.push({ role: 'assistant', content });
+      continue;
+    }
+
+    if (msg.role === 'tool') {
       const name = msg.name || msg.tool_call_id || 'unknown';
       const result = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-      
+
       if (hasTools) {
-        // 有 tools：用定界符包裹
-        messages.push({
+        outMessages.push({
           role: 'user',
-          content: `${m.RESULT_START}[${name}]\n${result}${m.RESULT_END}`
+          content: `${m.RESULT_START}[${name}]\n${result}${m.RESULT_END}`,
         });
       } else {
-        // 无 tools：清洗历史，转为纯文本
-        messages.push({
+        outMessages.push({
           role: 'user',
-          content: `[Result from ${name}]:\n${result}`
+          content: `[Tool result: ${name}]\n${result}`,
         });
       }
-
-    } else {
-      messages.push({ ...msg });
+      continue;
     }
+
+    // passthrough other roles
+    outMessages.push({ ...msg });
   }
 
   if (!hasSystem && toolSystemPrompt) {
-    messages.unshift({ role: 'system', content: toolSystemPrompt });
+    outMessages.unshift({ role: 'system', content: toolSystemPrompt });
   }
 
-  // 合并相邻消息
-  messages = mergeAdjacentMessages(messages, logger);
+  const merged = mergeAdjacentMessages(outMessages);
 
-  const newRequest = { ...request, messages };
+  const newRequest = { ...request, messages: merged };
   delete newRequest.tools;
   delete newRequest.tool_choice;
-  
+
   return newRequest;
 }
 
-// ============ 流式转换 ============
-function createStreamTransformer(logger = null) {
-  const startMarker = delimiter.markers.TC_START;
-  let lineBuffer = '';
-  let contentBuffer = '';
-  let isBuffering = false;
-  let pendingText = '';
-  let streamEnded = false;
+// ============ SSE parsing / formatting ============
 
-  function textChunk(text) {
-    if (!text) return null;
-    return `data: ${JSON.stringify({
-      id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
-    })}\n\n`;
+/**
+ * Minimal SSE event parser:
+ * - Accumulates incoming text
+ * - Splits by "\n\n" (blank line) to get events
+ * - Within one event, collects multiple "data:" lines and joins with "\n" (SSE spec)
+ */
+class SseEventParser {
+  constructor() {
+    this.buffer = '';
   }
 
-  function toolCallChunks(toolCalls) {
-    return toolCalls.map((tc, i) => `data: ${JSON.stringify({
-      id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      choices: [{ index: 0, delta: { tool_calls: [{ index: i, ...tc }] }, finish_reason: null }]
-    })}\n\n`).join('');
-  }
+  pushText(text) {
+    this.buffer += text;
+    const events = [];
 
-  function finishChunk(reason) {
-    return `data: ${JSON.stringify({
-      id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      choices: [{ index: 0, delta: {}, finish_reason: reason }]
-    })}\n\n`;
-  }
-
-  function processLine(line, push) {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-
-    if (trimmed === 'data: [DONE]') {
-      streamEnded = true;
-      if (pendingText) {
-        const tc = textChunk(pendingText);
-        if (tc) push(tc);
-        pendingText = '';
-      }
-      if (contentBuffer) {
-        const { toolCalls, cleanContent } = delimiter.parse(contentBuffer, logger);
-        if (cleanContent) {
-          const tc = textChunk(cleanContent);
-          if (tc) push(tc);
-        }
-        if (toolCalls.length > 0) {
-          push(toolCallChunks(toolCalls));
-          push(finishChunk('tool_calls'));
-        } else {
-          push(finishChunk('stop'));
-        }
-        contentBuffer = '';
-      } else {
-        push(finishChunk('stop'));
-      }
-      push('data: [DONE]\n\n');
-      return;
+    while (true) {
+      const idx = this.buffer.indexOf('\n\n');
+      if (idx === -1) break;
+      const rawEvent = this.buffer.slice(0, idx);
+      this.buffer = this.buffer.slice(idx + 2);
+      events.push(rawEvent);
     }
 
-    if (!trimmed.startsWith('data: ')) return;
+    return events;
+  }
 
-    let parsed;
+  static extractDataLines(rawEvent) {
+    // Supports: data: xxx  (possibly multiple lines)
+    const lines = rawEvent.split('\n');
+    const datas = [];
+    for (const line of lines) {
+      if (line.startsWith('data:')) {
+        datas.push(line.slice(5).trimStart());
+      }
+    }
+    return datas;
+  }
+
+  static isDoneEvent(rawEvent) {
+    const datas = SseEventParser.extractDataLines(rawEvent);
+    return datas.length === 1 && datas[0] === '[DONE]';
+  }
+
+  static parseJsonFromEvent(rawEvent) {
+    const datas = SseEventParser.extractDataLines(rawEvent);
+    if (datas.length === 0) return null;
+    if (datas.length === 1 && datas[0] === '[DONE]') return { __done: true };
+
+    const joined = datas.join('\n');
     try {
-      parsed = JSON.parse(trimmed.slice(6));
-    } catch { return; }
+      return JSON.parse(joined);
+    } catch {
+      return { __raw: rawEvent };
+    }
+  }
+}
 
-    const content = parsed.choices?.[0]?.delta?.content;
-    if (content === undefined || content === null) return;
+function sseEncodeData(data) {
+  return `data: ${data}\n\n`;
+}
 
-    if (isBuffering) {
-      contentBuffer += content;
-    } else {
-      const combined = pendingText + content;
-      const startIdx = combined.indexOf(startMarker);
-      if (startIdx !== -1) {
-        const before = combined.slice(0, startIdx);
-        if (before) {
-          const tc = textChunk(before);
-          if (tc) push(tc);
-        }
-        contentBuffer = combined.slice(startIdx);
-        pendingText = '';
-        isBuffering = true;
-      } else {
-        // 简单处理：如果 buffer 没满且没有标记，直接输出
-        // 这里简化了 findPartialMatch 逻辑，直接输出以提高响应速度
-        // 只有当末尾可能是标记的一部分时才 pending
-        // 为安全起见，我们假设只要没有 startMarker 的首字符，就是安全的
-        if (combined.includes(startMarker[0])) {
-           // 极简处理，实际生产可以使用更复杂的 partial match
-           pendingText = combined; 
-        } else {
-           const tc = textChunk(combined);
-           if (tc) push(tc);
-           pendingText = '';
-        }
+function sseEncodeJson(obj) {
+  return sseEncodeData(JSON.stringify(obj));
+}
+
+function cloneJson(obj) {
+  return obj ? JSON.parse(JSON.stringify(obj)) : obj;
+}
+
+// ============ Transparent stream transformer ============
+
+/**
+ * Creates a Transform stream that:
+ * - Parses upstream SSE events
+ * - Transparently forwards all fields
+ * - Only intercepts/rewrites choices[].delta.content to extract AnyToolCall blocks
+ * - Before [DONE], if tool calls found, injects one extra SSE json event with delta.tool_calls
+ */
+function createTransparentToolStreamTransformer() {
+  const startMarker = delimiter.markers.TC_START;
+
+  const parser = new SseEventParser();
+
+  let pendingText = '';        // tail text possibly containing partial marker
+  let bufferingTool = false;   // once we see marker, we buffer everything to parse at end
+  let toolBuffer = '';         // buffered content from marker to end
+
+  // keep last upstream envelope for injected tool_calls event
+  let lastEnvelope = null; // {id, object, created, model, ...} as json event
+
+  function findPartialMatchEndIndex(text, marker) {
+    // returns safe cut index (0..len)
+    // if text ends with a prefix of marker, we must keep that prefix in pendingText
+    for (let i = marker.length - 1; i > 0; i--) {
+      if (text.endsWith(marker.slice(0, i))) {
+        return text.length - i;
       }
     }
+    return text.length;
+  }
+
+  function splitByMarker(text, marker) {
+    // Returns { before, markerAndAfter? }
+    const idx = text.indexOf(marker);
+    if (idx === -1) return null;
+    return { before: text.slice(0, idx), after: text.slice(idx) };
+  }
+
+  function injectToolCallsEvent(baseEvent, toolCalls) {
+    // Build a minimal delta tool_calls patch event, while preserving upstream metadata.
+    const evt = cloneJson(baseEvent) || {};
+    if (!evt.choices || !Array.isArray(evt.choices) || evt.choices.length === 0) {
+      evt.choices = [{ index: 0, delta: {}, finish_reason: null }];
+    }
+
+    // Keep existing choices length but only patch choice[0]
+    const choice0 = evt.choices[0] || { index: 0, delta: {}, finish_reason: null };
+    choice0.delta = choice0.delta && typeof choice0.delta === 'object' ? choice0.delta : {};
+    choice0.delta.tool_calls = toolCalls.map((tc, i) => ({ index: i, ...tc }));
+    // keep finish_reason null for tool call delta patch
+    choice0.finish_reason = null;
+    evt.choices[0] = choice0;
+
+    // do not touch usage if present; but most patch events won't include usage
+    return evt;
   }
 
   return new Transform({
     transform(chunk, encoding, callback) {
-      const text = chunk.toString();
-      lineBuffer += text;
-      const lines = lineBuffer.split('\n');
-      lineBuffer = lines.pop() || '';
-      const push = (data) => this.push(data);
-      for (const line of lines) processLine(line, push);
+      const text = chunk.toString('utf8');
+      const rawEvents = parser.pushText(text);
+
+      for (const rawEvent of rawEvents) {
+        // [DONE]
+        if (SseEventParser.isDoneEvent(rawEvent)) {
+          // flush pendingText (as normal content) before tool parsing
+          if (pendingText && !bufferingTool) {
+            // We need a base envelope to emit; if none, just forward pending as raw text event is impossible.
+            // We'll only emit pendingText via rewriting an existing envelope later; if none exists, drop (shouldn't happen).
+          }
+
+          if (toolBuffer) {
+            const { toolCalls, cleanContent } = delimiter.parse(toolBuffer);
+            // Emit remaining clean content (if any) as a final content patch event
+            if (cleanContent && lastEnvelope) {
+              const evt = cloneJson(lastEnvelope);
+              // patch only delta.content
+              if (evt.choices && evt.choices[0]) {
+                evt.choices[0].delta = evt.choices[0].delta || {};
+                evt.choices[0].delta.content = cleanContent;
+              }
+              this.push(sseEncodeJson(evt));
+            }
+
+            if (toolCalls.length > 0 && lastEnvelope) {
+              const patchEvt = injectToolCallsEvent(lastEnvelope, toolCalls);
+              this.push(sseEncodeJson(patchEvt));
+            }
+          } else if (pendingText && lastEnvelope) {
+            // if we never entered bufferingTool but have pending tail, emit it
+            const evt = cloneJson(lastEnvelope);
+            evt.choices[0].delta = evt.choices[0].delta || {};
+            evt.choices[0].delta.content = pendingText;
+            this.push(sseEncodeJson(evt));
+          }
+
+          // Finally forward DONE
+          this.push(sseEncodeData('[DONE]'));
+          continue;
+        }
+
+        const parsed = SseEventParser.parseJsonFromEvent(rawEvent);
+
+        // If we can't parse JSON, forward raw as-is (best effort)
+        if (!parsed || parsed.__raw) {
+          // raw passthrough, keep original formatting
+          this.push(rawEvent + '\n\n');
+          continue;
+        }
+
+        // record last upstream envelope for patching
+        lastEnvelope = parsed;
+
+        // If no choices/delta.content -> transparent pass-through
+        const choices = parsed.choices;
+        if (!Array.isArray(choices) || choices.length === 0) {
+          this.push(sseEncodeJson(parsed));
+          continue;
+        }
+
+        // For OpenAI-style streaming: only handle choices[0].delta.content if present
+        const delta = choices[0]?.delta;
+        const content = delta?.content;
+
+        // If content absent (e.g. reasoning_content-only chunk, usage-only chunk): passthrough
+        if (typeof content !== 'string' || content.length === 0) {
+          this.push(sseEncodeJson(parsed));
+          continue;
+        }
+
+        // If already buffering tool calls: swallow content into toolBuffer, but keep other delta fields
+        if (bufferingTool) {
+          toolBuffer += content;
+
+          // Transparent pass: remove content to avoid showing delimiters to client
+          const outEvt = cloneJson(parsed);
+          if (outEvt.choices?.[0]?.delta && typeof outEvt.choices[0].delta === 'object') {
+            // preserve other keys (reasoning_content etc.), only remove content
+            delete outEvt.choices[0].delta.content;
+          }
+          this.push(sseEncodeJson(outEvt));
+          continue;
+        }
+
+        // Not buffering: scan for marker
+        const combined = pendingText + content;
+        const hit = splitByMarker(combined, startMarker);
+
+        if (hit) {
+          // emit before-text as normal content
+          if (hit.before && hit.before.length > 0) {
+            const outEvt = cloneJson(parsed);
+            outEvt.choices[0].delta = outEvt.choices[0].delta || {};
+            outEvt.choices[0].delta.content = hit.before;
+            this.push(sseEncodeJson(outEvt));
+          } else {
+            // if before empty, we should remove content to avoid leaking marker start
+            const outEvt = cloneJson(parsed);
+            if (outEvt.choices?.[0]?.delta && typeof outEvt.choices[0].delta === 'object') {
+              delete outEvt.choices[0].delta.content;
+            }
+            this.push(sseEncodeJson(outEvt));
+          }
+
+          // start buffering from marker
+          toolBuffer = hit.after;
+          pendingText = '';
+          bufferingTool = true;
+          continue;
+        }
+
+        // No hit: keep possible partial marker tail in pendingText
+        const safeEnd = findPartialMatchEndIndex(combined, startMarker);
+        const safeText = combined.slice(0, safeEnd);
+        const tail = combined.slice(safeEnd);
+
+        if (safeText.length > 0) {
+          const outEvt = cloneJson(parsed);
+          outEvt.choices[0].delta = outEvt.choices[0].delta || {};
+          outEvt.choices[0].delta.content = safeText;
+          this.push(sseEncodeJson(outEvt));
+        } else {
+          // nothing safe to emit, but still passthrough other fields (minus content) if any
+          const outEvt = cloneJson(parsed);
+          if (outEvt.choices?.[0]?.delta && typeof outEvt.choices[0].delta === 'object') {
+            delete outEvt.choices[0].delta.content;
+          }
+          this.push(sseEncodeJson(outEvt));
+        }
+
+        pendingText = tail;
+      }
+
       callback();
     },
+
     flush(callback) {
-      if (streamEnded) {
-        if (logger) logger.save();
-        callback();
-        return;
+      // If upstream ended abruptly without [DONE], best effort: flush pending
+      if (pendingText && lastEnvelope && !bufferingTool) {
+        const evt = cloneJson(lastEnvelope);
+        evt.choices[0].delta = evt.choices[0].delta || {};
+        evt.choices[0].delta.content = pendingText;
+        this.push(sseEncodeJson(evt));
       }
-      const push = (data) => this.push(data);
-      if (lineBuffer) { processLine(lineBuffer, push); lineBuffer = ''; }
-      if (pendingText) { const tc = textChunk(pendingText); if (tc) this.push(tc); pendingText = ''; }
-      if (contentBuffer) {
-        const { toolCalls, cleanContent } = delimiter.parse(contentBuffer, logger);
-        if (cleanContent) { const tc = textChunk(cleanContent); if (tc) this.push(tc); }
+
+      if (toolBuffer && lastEnvelope) {
+        const { toolCalls, cleanContent } = delimiter.parse(toolBuffer);
+
+        if (cleanContent) {
+          const evt = cloneJson(lastEnvelope);
+          evt.choices[0].delta = evt.choices[0].delta || {};
+          evt.choices[0].delta.content = cleanContent;
+          this.push(sseEncodeJson(evt));
+        }
+
         if (toolCalls.length > 0) {
-          this.push(toolCallChunks(toolCalls));
-          this.push(finishChunk('tool_calls'));
-        } else { this.push(finishChunk('stop')); }
-      } else { this.push(finishChunk('stop')); }
-      this.push('data: [DONE]\n\n');
-      if (logger) logger.save();
+          const patchEvt = injectToolCallsEvent(lastEnvelope, toolCalls);
+          this.push(sseEncodeJson(patchEvt));
+        }
+      }
+
+      // Do not force [DONE] here; upstream should provide it in normal cases.
       callback();
-    }
+    },
   });
 }
 
-// ============ URL 解析 ============
+// ============ Upstream URL extraction ============
 function extractUpstream(reqUrl) {
+  // format: /https://api.xxx/v1/chat/completions
   const match = reqUrl.match(/^\/(https?:\/\/.+)$/);
   if (!match) return null;
   return match[1];
 }
 
-// ============ 主处理 ============
+function hasToolHistory(body) {
+  const msgs = body?.messages;
+  if (!Array.isArray(msgs)) return false;
+  return msgs.some((m) => m?.role === 'tool' || (m?.role === 'assistant' && Array.isArray(m?.tool_calls) && m.tool_calls.length > 0));
+}
+
+// ============ Main handler ============
 async function handleRequest(req, res) {
   const logger = new RequestLogger();
+
   const upstream = extractUpstream(req.originalUrl);
-  
-  // 1. 验证上游 URL (SSRF 防护)
-  const validation = await validateUpstream(upstream);
-  if (!validation.valid) {
-    logger.log('BLOCKED', validation.error);
-    logger.save();
-    return res.status(403).json({
-      error: { message: `Access denied: ${validation.error}`, type: 'security_error' }
+  if (!upstream) {
+    return res.status(400).json({
+      error: { message: 'Invalid URL format. Use: /{upstream_url}', type: 'invalid_request' },
     });
   }
 
-  logger.log('REQUEST', `${req.method} ${upstream}`);
-
-  const isChatCompletions = upstream.includes('/chat/completions');
-  let body = req.body;
-  const hasTools = isChatCompletions && body?.tools?.length > 0;
-  const isStream = body?.stream === true;
-  
-  // 检查历史消息是否包含 tool 相关内容 (用于清洗历史)
-  const hasToolHistory = body?.messages?.some(m => 
-    m.role === 'tool' || (m.role === 'assistant' && m.tool_calls?.length)
-  );
-
-  // 只要有 tools 或者历史里有 tool，都需要经过 transform
-  const needsTransform = isChatCompletions && (hasTools || hasToolHistory);
-  
-  if (needsTransform) {
-    body = transformRequest(body, logger, hasTools);
+  const validate = await validateUpstream(upstream);
+  if (!validate.ok) {
+    return res.status(403).json({
+      error: { message: `Access denied: ${validate.error}`, type: 'security_error' },
+    });
   }
 
+  const isChatCompletions = upstream.includes('/chat/completions');
+
+  let body = req.body;
+  const isStream = body?.stream === true;
+
+  const requestHasTools = !!(isChatCompletions && Array.isArray(body?.tools) && body.tools.length > 0);
+  const requestHasToolHistory = isChatCompletions && hasToolHistory(body);
+
+  const needsTransform = isChatCompletions && (requestHasTools || requestHasToolHistory);
+  if (needsTransform) {
+    body = transformRequest(body, { hasTools: requestHasTools });
+  }
+
+  // headers: forward auth and a few common keys; keep content-type
   const headers = {};
-  if (req.headers.authorization) headers['Authorization'] = req.headers.authorization;
-  if (req.headers['x-api-key']) headers['x-api-key'] = req.headers['x-api-key'];
-  if (req.headers['anthropic-version']) headers['anthropic-version'] = req.headers['anthropic-version'];
+  const auth = req.headers.authorization;
+  if (auth) headers['Authorization'] = auth;
+  const xApiKey = req.headers['x-api-key'];
+  if (xApiKey) headers['x-api-key'] = xApiKey;
+  const anthropicVersion = req.headers['anthropic-version'];
+  if (anthropicVersion) headers['anthropic-version'] = anthropicVersion;
+
   headers['Content-Type'] = 'application/json';
+
+  logger.log('UPSTREAM_REQUEST', { upstream, method: req.method, stream: isStream, needsTransform, requestHasTools, requestHasToolHistory });
 
   try {
     const upstreamRes = await fetch(upstream, {
@@ -517,22 +688,47 @@ async function handleRequest(req, res) {
 
     if (!upstreamRes.ok) {
       const errText = await upstreamRes.text();
-      logger.log('UPSTREAM_ERROR', `${upstreamRes.status}: ${errText}`);
+      logger.log('UPSTREAM_ERROR', { status: upstreamRes.status, body: errText });
       logger.save();
       return res.status(upstreamRes.status).send(errText);
     }
 
-    // A. 流式 + 需要解析工具
-    if (isStream && hasTools) {
+    // ===== Stream =====
+    if (isStream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
 
-      const transformer = createStreamTransformer(logger);
+      // If this request has tools, we need to parse injected tool calls in stream.
+      // Otherwise: pure passthrough.
+      const shouldTransformStream = requestHasTools;
+
       const reader = upstreamRes.body.getReader();
       const decoder = new TextDecoder();
 
-      transformer.on('data', c => res.write(c));
+      if (!shouldTransformStream) {
+        // Transparent passthrough
+        (async () => {
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              res.write(value);
+            }
+          } catch (e) {
+            // ignore
+          } finally {
+            res.end();
+            logger.save();
+          }
+        })();
+        return;
+      }
+
+      // Transform stream (transparent + minimal rewrite)
+      const transformer = createTransparentToolStreamTransformer();
+
+      transformer.on('data', (c) => res.write(c));
       transformer.on('end', () => res.end());
       transformer.on('error', () => res.end());
 
@@ -544,35 +740,22 @@ async function handleRequest(req, res) {
             transformer.write(decoder.decode(value, { stream: true }));
           }
           transformer.end();
-        } catch (err) { transformer.end(); }
-      })();
-      return;
-    }
-
-    // B. 流式 + 透传 (无工具)
-    if (isStream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      const reader = upstreamRes.body.getReader();
-      (async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            res.write(value);
-          }
-          res.end();
+        } catch (e) {
+          transformer.end();
+        } finally {
           logger.save();
-        } catch (err) { res.end(); }
+        }
       })();
+
       return;
     }
 
-    // C. 非流式
+    // ===== Non-stream =====
     const data = await upstreamRes.json();
 
-    if (hasTools && data.choices?.[0]?.message?.content) {
-      const { toolCalls, cleanContent } = delimiter.parse(data.choices[0].message.content, logger);
+    // If tools enabled, parse AnyToolCall from assistant message content
+    if (requestHasTools && data?.choices?.[0]?.message?.content) {
+      const { toolCalls, cleanContent } = delimiter.parse(data.choices[0].message.content);
       if (toolCalls.length > 0) {
         data.choices[0].message.tool_calls = toolCalls;
         data.choices[0].message.content = cleanContent || null;
@@ -581,16 +764,15 @@ async function handleRequest(req, res) {
     }
 
     logger.save();
-    res.json(data);
-
+    return res.json(data);
   } catch (err) {
-    logger.log('PROXY_ERROR', err.message);
+    logger.log('PROXY_ERROR', { message: err?.message, stack: err?.stack });
     logger.save();
-    res.status(502).json({ error: { message: err.message, type: 'proxy_error' } });
+    return res.status(502).json({ error: { message: err.message, type: 'proxy_error' } });
   }
 }
 
-// ============ 路由 ============
+// Express 5 compatible catch-all
 app.use((req, res, next) => {
   handleRequest(req, res).catch(next);
 });
@@ -600,24 +782,17 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: { message: err.message, type: 'server_error' } });
 });
 
-// ============ 启动 ============
 app.listen(PORT, () => {
   console.log(`
-╔════════════════════════════════════════════════════════╗
-║       🚀 AnyToolCall Proxy Started                     ║
-╠════════════════════════════════════════════════════════╣
-║  Port: ${String(PORT).padEnd(49)}║
-║  Local Net Access: ${(ALLOW_LOCAL_NET ? 'ALLOWED ⚠️' : 'BLOCKED 🔒').padEnd(38)}║
-║  Logging: ${(LOG_ENABLED ? 'ENABLED' : 'DISABLED').padEnd(46)}║
-║                                                        ║
-║  Features:                                             ║
-║  ✓ AnyToolCall Protocol (Unicode Delimiters)           ║
-║  ✓ Auto-merge adjacent same-role messages              ║
-║  ✓ Auto-sanitize tool history for non-tool requests    ║
-║  ✓ SSRF Protection                                     ║
-║                                                        ║
-║  Usage:                                                ║
-║  POST http://localhost:${PORT}/{upstream_api_url}           ║
-╚════════════════════════════════════════════════════════╝
-  `);
+╔═══════════════════════════════════════════════════════╗
+║               🚀 AnyToolCall Proxy Started            ║
+╠═══════════════════════════════════════════════════════╣
+║  Port: ${String(PORT).padEnd(47)}║
+║  Local Net: ${(ALLOW_LOCAL_NET ? 'ALLOWED (unsafe)' : 'BLOCKED (safe)').padEnd(42)}║
+║  Logging: ${(LOG_ENABLED ? `ENABLED -> ${LOG_DIR}` : 'DISABLED').padEnd(44)}║
+╠═══════════════════════════════════════════════════════╣
+║  Usage: POST http://localhost:${PORT}/{upstream_url}       ║
+║  Example: POST http://localhost:${PORT}/https://api.openai.com/v1/chat/completions
+╚═══════════════════════════════════════════════════════╝
+`);
 });
