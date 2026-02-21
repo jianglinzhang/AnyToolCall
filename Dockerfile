@@ -14,9 +14,9 @@ RUN npm install --production
 COPY index.js .
 
 ENV PORT=3000
-    LOG_ENABLED=false
-    LOG_DIR=./logs
-    ALLOW_LOCAL_NET=false
+ENV LOG_ENABLED=false
+ENV LOG_DIR=./logs
+ENV ALLOW_LOCAL_NET=false
 
 # 6. (可选) 如果你的程序监听了端口(比如 express 监听 3000)，把这行解开
 EXPOSE 3000
