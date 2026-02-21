@@ -22,4 +22,4 @@ ENV ALLOW_LOCAL_NET=false
 EXPOSE 3000
 
 # 7. 启动命令
-CMD ["npm", "start"]
+CMD ["node", "index.js"]
